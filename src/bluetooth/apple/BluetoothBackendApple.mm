@@ -17,9 +17,15 @@ struct CBLEDevice {
     std::vector<std::vector<ble_characteristic_t>> characteristics;
     std::vector<std::string> advertised_service_uuids;
     std::vector<std::string> cached_service_uuids;
+    ble_on_characteristic_notification_cb on_notification_cb = nullptr;
+    void* notification_user_data = nullptr;
+    ble_characteristic_t notification_characteristic_cache {};
+    std::string notification_characteristic_uuid;
     ble_on_device_disconnect_cb on_disconnect_cb = nullptr;
     void* disconnect_user_data = nullptr;
 };
+
+static CBLEDevice* findDeviceForPeripheral(CBPeripheral* peripheral);
 
 // Global central manager delegate
 @interface BLECentralDelegate : NSObject <CBCentralManagerDelegate, CBPeripheralDelegate>
@@ -243,8 +249,33 @@ didDiscoverCharacteristicsForService:(CBService *)service
 - (void)peripheral:(CBPeripheral *)peripheral
 didUpdateValueForCharacteristic:(CBCharacteristic *)characteristic
               error:(nullable NSError *)error {
-    if (error) return;
-    // Notification data is in characteristic.value
+    if (error || !characteristic.value) {
+        return;
+    }
+
+    CBLEDevice* ble_device = findDeviceForPeripheral(peripheral);
+    if (!ble_device || !ble_device->on_notification_cb) {
+        return;
+    }
+
+    NSData* value = characteristic.value;
+    const uint8_t* bytes = static_cast<const uint8_t*>([value bytes]);
+    size_t data_len = [value length];
+    if (!bytes || data_len == 0) {
+        return;
+    }
+
+    ble_device->notification_characteristic_uuid = [[characteristic.UUID UUIDString] UTF8String];
+    ble_device->notification_characteristic_cache.uuid = ble_device->notification_characteristic_uuid.c_str();
+    ble_device->notification_characteristic_cache.backend_state = (void*)characteristic;
+
+    ble_device->on_notification_cb(
+        &ble_device->c_device,
+        &ble_device->notification_characteristic_cache,
+        bytes,
+        data_len,
+        ble_device->notification_user_data
+    );
 }
 
 @end
@@ -254,6 +285,22 @@ static BLECentralDelegate* g_central_delegate = nullptr;
 static std::map<ble_device_manager_t*, std::vector<std::shared_ptr<CBLEDevice>>> g_devices_map;
 static std::map<ble_device_manager_t*, ble_on_device_found_cb> g_found_callbacks;
 static std::map<ble_device_manager_t*, void*> g_found_user_data;
+
+static CBLEDevice* findDeviceForPeripheral(CBPeripheral* peripheral) {
+    if (!peripheral) {
+        return nullptr;
+    }
+
+    for (auto& entry : g_devices_map) {
+        for (auto& device : entry.second) {
+            if (device && device->peripheral && [device->peripheral.identifier isEqual:peripheral.identifier]) {
+                return device.get();
+            }
+        }
+    }
+
+    return nullptr;
+}
 
 // Helper to convert NSString to C string
 static const char* nsstringToCString(NSString* str) {
@@ -587,8 +634,11 @@ ble_status_t ble_backend_characteristic_subscribe(
         return BLE_STATUS_ERROR;
     }
 
-    // Store notification callback in device for use in didUpdateValueForCharacteristic
-    ble_device->c_device.backend_state = (void*)on_notification;
+    ble_device->on_notification_cb = on_notification;
+    ble_device->notification_user_data = user_data;
+    ble_device->notification_characteristic_uuid = characteristic->uuid ? characteristic->uuid : "";
+    ble_device->notification_characteristic_cache.uuid = ble_device->notification_characteristic_uuid.c_str();
+    ble_device->notification_characteristic_cache.backend_state = characteristic->backend_state;
 
     [ble_device->peripheral setNotifyValue:YES forCharacteristic:cb_char];
 
@@ -611,6 +661,11 @@ ble_status_t ble_backend_characteristic_unsubscribe(
     }
 
     [ble_device->peripheral setNotifyValue:NO forCharacteristic:cb_char];
+    ble_device->on_notification_cb = nullptr;
+    ble_device->notification_user_data = nullptr;
+    ble_device->notification_characteristic_uuid.clear();
+    ble_device->notification_characteristic_cache.uuid = nullptr;
+    ble_device->notification_characteristic_cache.backend_state = nullptr;
 
     return BLE_STATUS_OK;
 }
